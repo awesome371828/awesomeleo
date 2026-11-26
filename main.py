@@ -49,6 +49,8 @@ DB_PATH = os.getenv("DB_PATH", "data/awesomevpn.sqlite3")
 PLATEGA_API = os.getenv("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
 PAYMENT_METHOD = int(os.getenv("PLATEGA_PAYMENT_METHOD", "2"))
 CURRENCY = os.getenv("CURRENCY", "RUB")
+PAYMENT_RETURN_URL = os.getenv("PLATEGA_RETURN_URL", "https://t.me/").strip() or "https://t.me/"
+PAYMENT_FAILED_URL = os.getenv("PLATEGA_FAILED_URL", PAYMENT_RETURN_URL).strip() or PAYMENT_RETURN_URL
 DEFAULT_TRAFFIC_GB = float(os.getenv("TRAFFIC_LIMIT_GB", "0"))
 DEFAULT_CHANNELS = [x.strip() for x in os.getenv("PANEL_CHANNELS", "main,reality").split(",") if x.strip()]
 LOCATIONS = json.loads(os.getenv("PANEL_LOCATIONS_JSON", "{}") or "{}")
@@ -401,6 +403,8 @@ async def create_plan_payment(c: CallbackQuery, plan_key: str, selected: list[st
             "paymentMethod": PAYMENT_METHOD,
             "paymentDetails": {"amount": plan["price"], "currency": CURRENCY},
             "description": f"Awesome VPN — {plan['title']}",
+            "return": PAYMENT_RETURN_URL,
+            "failedUrl": PAYMENT_FAILED_URL,
             "payload": order_id,
             "orderId": order_id,
             "metadata": {"userId": str(c.from_user.id), "userName": c.from_user.username or "",
@@ -727,6 +731,8 @@ async def balance_amount(c: CallbackQuery):
             "paymentMethod": PAYMENT_METHOD,
             "paymentDetails": {"amount": amount, "currency": CURRENCY},
             "description": "Пополнение баланса Awesome VPN",
+            "return": PAYMENT_RETURN_URL,
+            "failedUrl": PAYMENT_FAILED_URL,
             "payload": order_id, "orderId": order_id,
             "metadata": {"userId": str(c.from_user.id), "userName": c.from_user.username or "",
                          "user_email": f"{c.from_user.id}@telegram.org"}
