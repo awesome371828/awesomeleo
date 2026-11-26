@@ -55,7 +55,15 @@ if not BOT_TOKEN:
 if not PANEL_API_TOKEN or not PANEL_API_URL:
     raise RuntimeError("PANEL_API_TOKEN and PANEL_API_URL are required")
 if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
-    raise RuntimeError("PLATEGA_MERCHANT_ID and PLATEGA_SECRET are required")
+    # Never log credentials; report presence flags only to diagnose missing Relax Dev variables.
+    log.error(
+        "Platega environment check: PLATEGA_MERCHANT_ID=%s, PLATEGA_SECRET/PLATEGA_API=%s",
+        bool(PLATEGA_MERCHANT_ID), bool(PLATEGA_SECRET)
+    )
+    raise RuntimeError(
+        "Platega credentials are not visible to this process. In Relax Dev, save "
+        "PLATEGA_MERCHANT_ID and PLATEGA_SECRET, then restart/redeploy the latest commit."
+    )
 if not PUBLIC_BASE_URL.startswith("https://"):
     raise RuntimeError("PUBLIC_BASE_URL must be a public HTTPS URL")
 
