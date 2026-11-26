@@ -766,6 +766,290 @@ async def noop(c: CallbackQuery):
     await c.answer()
 
 
+
+# ------------------------- ADMIN CONTROL PANEL -------------------------
+admin_sessions: dict[int, dict] = {}
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def admin_kb() -> InlineKeyboardMarkup:
+    return kb([
+        [("➕ Выдать подписку", "adm:issue"), ("➖ Забрать подписку", "adm:revoke")],
+        [("👥 Пользователи", "adm:users"), ("💳 Платежи", "adm:payments")],
+        [("🌍 Обновить локации H1", "adm:discover"), ("📊 Статистика", "adm:stats")],
+        [("❌ Закрыть", "adm:close")],
+    ])
+
+async def admin_home(message: Message):
+    if not is_admin(message.from_user.id):
+        return await message.answer("⛔ Нет доступа.")
+    admin_sessions.pop(message.from_user.id, None)
+    await message.answer(
+        "🛠 <b>Панель администратора Awesome VPN</b>\n\n"
+        "Выдача и отзыв подписок, поиск пользователей, платежи и состояние H1.",
+        reply_markup=admin_kb()
+    )
+
+@dp.message(Command("admin"))
+async def admin_command(message: Message):
+    await admin_home(message)
+
+@dp.message(Command("cancel"))
+async def admin_cancel(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    admin_sessions.pop(message.from_user.id, None)
+    await message.answer("Действие отменено.", reply_markup=admin_kb())
+
+async def admin_find_user(query: str):
+    """Resolve by numeric Telegram ID or an already-known @username."""
+    assert db
+    raw = query.strip()
+    if raw.startswith("@"):
+        raw = raw[1:]
+    if raw.isdigit():
+        cur = await db.execute("SELECT * FROM users WHERE tg_id=?", (int(raw),))
+    else:
+        cur = await db.execute("SELECT * FROM users WHERE lower(username)=lower(?) ORDER BY created_at DESC LIMIT 1", (raw,))
+    return await cur.fetchone()
+
+def admin_user_card(row) -> str:
+    username = ("@" + row["username"]) if row["username"] else "не указан"
+    expiry = int(row["expires_at"] or 0)
+    expiry_text = datetime.fromtimestamp(expiry, timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M") if expiry else "нет активного срока"
+    return (
+        f"👤 <b>Пользователь</b>\nID: <code>{row['tg_id']}</code>\n"
+        f"Username: {html.escape(username)}\nПодписка: <code>{html.escape(row['client_name'] or 'не создана')}</code>\n"
+        f"Срок: {expiry_text}\nБаланс: {float(row['balance'] or 0):.2f} ₽"
+    )
+
+async def admin_create_subscription(target_id: int, plan_key: str) -> str:
+    """Create/extend one unified H1 client across every discovered federation node."""
+    assert db
+    plan = PLANS[plan_key]
+    discovered, _ = await discover_h1_locations()
+    if discovered:
+        LOCATIONS.clear()
+        LOCATIONS.update(discovered)
+    if not LOCATIONS:
+        raise RuntimeError("H1 не вернул ни одной распознанной локации.")
+    cur = await db.execute("SELECT * FROM users WHERE tg_id=?", (target_id,))
+    user = await cur.fetchone()
+    if not user:
+        raise RuntimeError("Пользователь не найден в базе. Он должен хотя бы один раз открыть бота.")
+    client_name = user["client_name"] or f"tg_{target_id}"
+    client_uuid = user["client_uuid"] or str(uuid.uuid4())
+    expires_at = max(int(user["expires_at"] or 0), int(time.time())) + plan["days"] * 86400
+    grouped: dict[str, dict] = {}
+    for cfg in LOCATIONS.values():
+        node_id = str(cfg.get("node_id", "")).strip()
+        item = grouped.setdefault(node_id, {"inbound_ids": [], "channels": []})
+        for inbound_id in cfg.get("inbound_ids", []):
+            if str(inbound_id) not in item["inbound_ids"]:
+                item["inbound_ids"].append(str(inbound_id))
+        for channel in cfg.get("channels", DEFAULT_CHANNELS):
+            if channel not in item["channels"]:
+                item["channels"].append(channel)
+    completed = []
+    for node_id, cfg in grouped.items():
+        if not cfg["inbound_ids"]:
+            raise RuntimeError(f"Нет inbound_ids для узла {node_id or 'primary'}.")
+        base = f"/fed/lproxy/{quote(node_id, safe='')}" if node_id else ""
+        client_path = f"{base}/clients/{quote(client_name, safe='')}"
+        create_path = f"{base}/create"
+        existing_client = None
+        try:
+            existing = await panel_request("GET", client_path)
+            candidate = existing.get("client", existing)
+            if isinstance(candidate, dict) and str(candidate.get("uuid") or "") == client_uuid:
+                existing_client = candidate
+        except Exception:
+            pass
+        if existing_client:
+            await panel_request("PATCH", client_path, {
+                "expires_at": expires_at, "device_limit": plan["devices"],
+                "traffic_limit_gb": DEFAULT_TRAFFIC_GB
+            })
+        else:
+            await panel_request("POST", create_path, {
+                "name": client_name, "uuid": client_uuid, "expires_at": expires_at,
+                "device_limit": plan["devices"], "traffic_limit_gb": DEFAULT_TRAFFIC_GB,
+                "manual": True, "channels": cfg["channels"] or DEFAULT_CHANNELS,
+                "inbound_ids": cfg["inbound_ids"]
+            })
+        completed.append(node_id or "primary")
+    canonical = await panel_request("GET", f"/clients/{quote(client_name, safe='')}")
+    client = canonical.get("client", canonical)
+    sub_url = client.get("subscription_url") or client.get("sub_url") or ""
+    if not sub_url:
+        raise RuntimeError("H1 не вернул subscription_url. Проверьте клиента в панели; не повторяйте выдачу вслепую.")
+    await db.execute(
+        "UPDATE users SET client_name=?,client_uuid=?,sub_url=?,expires_at=?,device_limit=?,selected_locations=? WHERE tg_id=?",
+        (client_name, client_uuid, sub_url, expires_at, plan["devices"], json.dumps(list(LOCATIONS.keys()), ensure_ascii=False), target_id)
+    )
+    await db.commit()
+    try:
+        await bot.send_message(target_id,
+            "🎉 <b>Вам выдана подписка Awesome VPN!</b>\n"
+            f"Тариф: {html.escape(plan['title'])}\n"
+            f"Действует до: {datetime.fromtimestamp(expires_at, timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=profile_kb(sub_url))
+    except Exception:
+        log.warning("Could not notify user %s after admin provisioning", target_id)
+    return f"Выдано успешно.\nУзлы: {', '.join(completed)}\nСрок до: {datetime.fromtimestamp(expires_at, timezone.utc).astimezone().strftime('%d.%m.%Y %H:%M')}\nПодписка: {html.escape(sub_url)}"
+
+async def admin_revoke_subscription(target_id: int) -> str:
+    """Delete the user's H1 client from primary and every linked federation node."""
+    assert db
+    cur = await db.execute("SELECT * FROM users WHERE tg_id=?", (target_id,))
+    user = await cur.fetchone()
+    if not user or not user["client_name"]:
+        raise RuntimeError("У пользователя нет сохранённой подписки.")
+    discovered, _ = await discover_h1_locations()
+    if discovered:
+        LOCATIONS.clear()
+        LOCATIONS.update(discovered)
+    node_ids = {str(cfg.get("node_id", "")).strip() for cfg in LOCATIONS.values()}
+    node_ids.add("")
+    errors, removed = [], []
+    for node_id in sorted(node_ids):
+        prefix = f"/fed/lproxy/{quote(node_id, safe='')}" if node_id else ""
+        path = f"{prefix}/clients/{quote(user['client_name'], safe='')}"
+        try:
+            await panel_request("DELETE", path)
+            removed.append(node_id or "primary")
+        except Exception as exc:
+            # A missing client on a node is harmless only if API clearly says not found.
+            msg = str(exc)
+            if "404" in msg or "not found" in msg.lower() or "не найден" in msg.lower():
+                continue
+            errors.append(f"{node_id or 'primary'}: {msg[:160]}")
+    if errors:
+        raise RuntimeError("Не все узлы подтвердили отзыв: " + "; ".join(errors) + ". Локальная запись сохранена для ручной сверки.")
+    await db.execute(
+        "UPDATE users SET client_name=NULL,client_uuid=NULL,sub_url=NULL,expires_at=NULL,device_limit=0,selected_locations='[]' WHERE tg_id=?",
+        (target_id,)
+    )
+    await db.commit()
+    try:
+        await bot.send_message(target_id, "⛔ Ваша подписка Awesome VPN отозвана администратором.")
+    except Exception:
+        pass
+    return "Подписка отозвана на узлах: " + (", ".join(removed) or "клиент не найден на узлах") + "."
+
+@dp.callback_query(F.data.startswith("adm:"))
+async def admin_callbacks(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Нет доступа", show_alert=True)
+    action = c.data.split(":", 1)[1]
+    admin_sessions.pop(c.from_user.id, None)
+    if action == "close":
+        await c.message.edit_text("Панель администратора закрыта.")
+    elif action == "issue":
+        admin_sessions[c.from_user.id] = {"step": "issue_target"}
+        await c.message.edit_text("➕ <b>Выдача подписки</b>\n\nОтправьте Telegram ID или @username пользователя.\nПользователь должен хотя бы раз запустить бота.\n\n/cancel — отмена")
+    elif action == "revoke":
+        admin_sessions[c.from_user.id] = {"step": "revoke_target"}
+        await c.message.edit_text("➖ <b>Отзыв подписки</b>\n\nОтправьте Telegram ID или @username пользователя.\n\n/cancel — отмена")
+    elif action == "users":
+        assert db
+        cur = await db.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 15")
+        rows = await cur.fetchall()
+        body = "\n\n".join(admin_user_card(row) for row in rows) or "Пользователей пока нет."
+        await c.message.edit_text("👥 <b>Последние пользователи</b>\n\n" + body[:3500], reply_markup=admin_kb())
+    elif action == "payments":
+        assert db
+        cur = await db.execute("SELECT order_id,tg_id,amount,plan_key,status,created_at FROM payments ORDER BY created_at DESC LIMIT 15")
+        rows = await cur.fetchall()
+        body = "\n".join(f"• <code>{r['order_id'][:8]}</code> | ID <code>{r['tg_id']}</code> | {r['amount']:.0f} ₽ | {html.escape(str(r['plan_key']))} | <b>{html.escape(r['status'])}</b>" for r in rows)
+        await c.message.edit_text("💳 <b>Последние платежи</b>\n\n" + (body or "Платежей пока нет.")[:3500], reply_markup=admin_kb())
+    elif action == "stats":
+        assert db
+        cur = await db.execute("SELECT COUNT(*) n FROM users")
+        users = (await cur.fetchone())["n"]
+        cur = await db.execute("SELECT COUNT(*) n FROM users WHERE sub_url IS NOT NULL AND sub_url!=''")
+        active = (await cur.fetchone())["n"]
+        cur = await db.execute("SELECT COALESCE(SUM(amount),0) total FROM payments WHERE status='CONFIRMED' AND plan_key NOT LIKE 'balance:%'")
+        revenue = (await cur.fetchone())["total"]
+        await c.message.edit_text(f"📊 <b>Статистика</b>\n\nПользователей: <b>{users}</b>\nС подпиской: <b>{active}</b>\nПодтверждённые продажи: <b>{revenue:.0f} ₽</b>", reply_markup=admin_kb())
+    elif action == "discover":
+        await c.message.edit_text("🔎 Обновляю список локаций H1…")
+        try:
+            found, report = await discover_h1_locations()
+            if found:
+                LOCATIONS.clear()
+                LOCATIONS.update(found)
+                details = "\n".join(f"• {html.escape(k)} — {len(v['inbound_ids'])} inbound, узел {html.escape(str(v['node_id']) or 'primary')}" for k,v in found.items())
+                await c.message.answer("✅ <b>Локации обновлены</b>\n" + details + "\n\n" + "\n".join(report), reply_markup=admin_kb())
+            else:
+                await c.message.answer("⚠️ Локации не найдены.\n" + "\n".join(report), reply_markup=admin_kb())
+        except Exception as exc:
+            await c.message.answer(f"❌ {html.escape(str(exc)[:700])}", reply_markup=admin_kb())
+    await c.answer()
+
+@dp.message(F.text)
+async def admin_text_input(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    state = admin_sessions.get(message.from_user.id)
+    if not state:
+        return
+    step = state.get("step")
+    if step in ("issue_target", "revoke_target"):
+        row = await admin_find_user(message.text)
+        if not row:
+            await message.answer("Пользователь не найден. Он должен хотя бы раз нажать /start в боте. Можно использовать его числовой Telegram ID.\n\nПопробуйте ещё раз или /cancel.")
+            return
+        state["target_id"] = int(row["tg_id"])
+        if step == "revoke_target":
+            admin_sessions.pop(message.from_user.id, None)
+            await message.answer(admin_user_card(row) + "\n\nПодтвердить отзыв подписки?",
+                reply_markup=kb([[("⛔ Да, отозвать", f"admconfirm:revoke:{row['tg_id']}")], [("Отмена", "adm:close")]]))
+        else:
+            state["step"] = "issue_plan"
+            rows = [[(f"{p['title']} — {p['price']} ₽", f"admplan:{key}")] for key,p in PLANS.items()]
+            rows.append([("Отмена", "adm:close")])
+            await message.answer(admin_user_card(row) + "\n\nВыберите срок выдачи:", reply_markup=kb(rows))
+    else:
+        return
+
+@dp.callback_query(F.data.startswith("admplan:"))
+async def admin_plan_choice(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Нет доступа", show_alert=True)
+    state = admin_sessions.get(c.from_user.id) or {}
+    target_id = state.get("target_id")
+    plan_key = c.data.split(":",1)[1]
+    if not target_id or plan_key not in PLANS:
+        admin_sessions.pop(c.from_user.id, None)
+        return await c.answer("Сессия истекла. Начните заново.", show_alert=True)
+    await c.answer("Выдаю подписку…")
+    await c.message.edit_text("⏳ Создаю/продлеваю клиента на всех узлах H1. Не запускайте выдачу повторно.")
+    try:
+        result = await admin_create_subscription(int(target_id), plan_key)
+        admin_sessions.pop(c.from_user.id, None)
+        await c.message.answer("✅ <b>Готово</b>\n\n" + result, reply_markup=admin_kb())
+    except Exception as exc:
+        log.exception("Admin subscription issuance failed")
+        await c.message.answer("❌ <b>Выдача не завершена</b>\n" + html.escape(str(exc)[:1200]) +
+            "\n\nПроверьте клиента на каждом узле H1 перед повторной попыткой.", reply_markup=admin_kb())
+
+@dp.callback_query(F.data.startswith("admconfirm:revoke:"))
+async def admin_revoke_confirm(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer("Нет доступа", show_alert=True)
+    target_id = int(c.data.rsplit(":",1)[1])
+    await c.answer("Отзываю…")
+    await c.message.edit_text("⏳ Удаляю клиента с основной панели и связанных узлов H1…")
+    try:
+        result = await admin_revoke_subscription(target_id)
+        await c.message.answer("✅ " + html.escape(result), reply_markup=admin_kb())
+    except Exception as exc:
+        log.exception("Admin subscription revoke failed")
+        await c.message.answer("❌ " + html.escape(str(exc)[:1200]), reply_markup=admin_kb())
+
+
 async def main():
     global http
     await init_db()
