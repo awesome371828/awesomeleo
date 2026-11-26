@@ -32,7 +32,7 @@ PANEL_API_URL = os.getenv("PANEL_API_URL", "").strip().rstrip("/")
 if PANEL_API_URL.endswith("/api"):
     PANEL_API_URL = PANEL_API_URL[:-4]
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
-PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
+PLATEGA_SECRET = (os.getenv("PLATEGA_SECRET", "") or os.getenv("PLATEGA_API", "")).strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 DB_PATH = os.getenv("DB_PATH", "data/awesomevpn.sqlite3")
