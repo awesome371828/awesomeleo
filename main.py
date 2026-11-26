@@ -40,7 +40,10 @@ CURRENCY = os.getenv("CURRENCY", "RUB")
 DEFAULT_TRAFFIC_GB = float(os.getenv("TRAFFIC_LIMIT_GB", "0"))
 DEFAULT_CHANNELS = [x.strip() for x in os.getenv("PANEL_CHANNELS", "main,reality").split(",") if x.strip()]
 LOCATIONS = json.loads(os.getenv("PANEL_LOCATIONS_JSON", "{}") or "{}")
-# Example: {"🇩🇪 Германия":{"node_id":"123","inbound_ids":["7"]},"🇳🇱 Нидерланды":{"node_id":"456","inbound_ids":["3"]}}
+if not isinstance(LOCATIONS, dict):
+    LOCATIONS = {}
+# If PANEL_LOCATIONS_JSON is empty, the bot discovers named inbounds from the
+# primary H1 panel and its linked federation nodes using read-only API calls.
 PLANS = {
     "3d": {"title": "3 дня", "days": 3, "price": 29, "devices": 2},
     "30d": {"title": "1 месяц", "days": 30, "price": 139, "devices": 3},
@@ -194,6 +197,101 @@ def _panel_items(data):
     return []
 
 
+def _first_field(item: dict, names: tuple[str, ...]):
+    for name in names:
+        value = item.get(name)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _inbound_location_label(item: dict) -> tuple[str, str] | None:
+    """Map only explicit inbound names to a country/feature; never infer by port."""
+    text_value = " ".join(
+        str(item.get(key, "")) for key in
+        ("remark", "tag", "name", "label", "title", "description", "country", "listen")
+    ).casefold()
+    compact = text_value.replace("_", " ").replace("-", " ")
+    rules = (
+        (("нидер", "netherlands", "holland", " nl "), "🇳🇱 Нидерланды", "main"),
+        (("польш", "poland", " pl "), "🇵🇱 Польша", "main"),
+        (("финлянд", "finland", " fi "), "🇫🇮 Финляндия", "main"),
+        (("герман", "germany", "deutschland", " de "), "🇩🇪 Германия", "main"),
+        (("сша", "usa", "united states", "america", " us "), "🇺🇸 США", "main"),
+        (("япони", "japan", " jp "), "🇯🇵 Япония", "main"),
+        (("обход бел", "white list", "whitelist", "bypass", " белых спис"), "🌍 Обход белых списков (IP)", "bs"),
+    )
+    padded = f" {compact} "
+    for needles, label, channel in rules:
+        if any(needle in padded for needle in needles):
+            return label, channel
+    return None
+
+
+async def discover_h1_locations() -> tuple[dict, list[str]]:
+    """Discover country inbounds on the primary panel and all linked H1 nodes."""
+    discovered: dict[str, dict] = {}
+    report: list[str] = []
+    node_rows: list[tuple[str, str]] = [("", "Основной сервер")]
+    federation = await panel_request("GET", "/fed/lagg")
+    for node in _panel_items(federation):
+        if not isinstance(node, dict):
+            continue
+        node_id = _first_field(node, ("node_id", "nodeId", "server_id", "serverId", "id"))
+        if node_id is None:
+            continue
+        node_name = str(_first_field(node, ("name", "remark", "title", "label", "address", "host")) or f"Узел {node_id}")
+        node_rows.append((str(node_id), node_name))
+
+    for node_id, node_name in node_rows:
+        path = f"/fed/lproxy/{quote(node_id, safe='')}/inbounds" if node_id else "/inbounds"
+        try:
+            response = await panel_request("GET", path)
+        except Exception as exc:
+            report.append(f"⚠️ {html.escape(node_name)}: не удалось получить инбаунды ({html.escape(str(exc)[:180])})")
+            continue
+        inbounds = _panel_items(response)
+        found_here = 0
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            inbound_id = _first_field(inbound, ("id", "inbound_id", "inboundId", "inboundID"))
+            mapped = _inbound_location_label(inbound)
+            if inbound_id is None or mapped is None:
+                continue
+            label, channel = mapped
+            cfg = discovered.setdefault(label, {"node_id": node_id, "inbound_ids": [], "channels": list(DEFAULT_CHANNELS)})
+            # One subscription is created per H1 node, with all matching local inbounds.
+            if cfg["node_id"] == node_id and str(inbound_id) not in [str(x) for x in cfg["inbound_ids"]]:
+                cfg["inbound_ids"].append(str(inbound_id))
+                if channel == "bs" and "bs" not in cfg["channels"]:
+                    cfg["channels"].append("bs")
+                found_here += 1
+        report.append(f"• {html.escape(node_name)}: просмотрено {len(inbounds)} инбаундов, распознано {found_here}")
+    return discovered, report
+
+
+@dp.message(Command("h1discover"))
+async def h1_discover_command(message: Message):
+    """Admin-only read-only H1 discovery and in-memory location refresh."""
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("Команда доступна только администратору.")
+    await message.answer("🔎 Ищу локации в основной панели и связке H1. Выполняю только GET-запросы.")
+    try:
+        discovered, report = await discover_h1_locations()
+        if discovered:
+            LOCATIONS.clear()
+            LOCATIONS.update(discovered)
+            names = "\n".join(f"• {html.escape(name)} — узел <code>{html.escape(str(cfg['node_id']) or 'primary')}</code>, inbound <code>{html.escape(','.join(cfg['inbound_ids']))}</code>" for name, cfg in discovered.items())
+            text = "✅ <b>Найдены локации:</b>\n" + names + "\n\n" + "\n".join(report) + "\n\nТеперь новые покупки будут включать все найденные локации в одну подписку."
+        else:
+            text = "⚠️ Не удалось автоматически распознать названия локаций.\n" + "\n".join(report) + "\n\nВыполни /h1diag и пришли ответ — по нему подстрою сопоставление."
+        await message.answer(text[:3900])
+    except Exception as exc:
+        log.exception("H1 discovery failed")
+        await message.answer(f"❌ Ошибка чтения H1 API: <code>{html.escape(str(exc)[:700])}</code>")
+
+
 @dp.message(Command("h1diag"))
 async def h1_diagnostics(message: Message):
     """Admin-only read-only discovery of connected H1 nodes and their inbounds."""
@@ -274,36 +372,8 @@ async def buy(c: CallbackQuery):
     await c.answer()
 
 
-@dp.callback_query(F.data.startswith("plan:"))
-async def choose_plan(c: CallbackQuery):
-    key = c.data.split(":", 1)[1]
-    plan = PLANS.get(key)
-    if not plan:
-        return await c.answer("Тариф не найден", show_alert=True)
-    if not LOCATIONS:
-        return await c.answer("Локации ещё не настроены администратором.", show_alert=True)
-    await ensure_user(c.from_user.id, c.from_user.username)
-    await c.message.edit_text(
-        f"📦 <b>{plan['title']} — {plan['price']} ₽</b>\n"
-        f"⏳ Срок: {plan['days']} дней\n📱 Устройств: {plan['devices']}\n\n"
-        "Выберите локации для подключения:",
-        reply_markup=location_keyboard("buy_loc:" + key))
-    await c.answer()
-
-
-@dp.callback_query(F.data.startswith("buy_loc:"))
-async def choose_locations(c: CallbackQuery):
-    _, plan_key, selection = c.data.split(":", 2)
-    if selection == "all":
-        selected = list(LOCATIONS.keys())
-    else:
-        try:
-            selected = [list(LOCATIONS.keys())[int(selection)]]
-        except (ValueError, IndexError):
-            return await c.answer("Локация не найдена", show_alert=True)
-    plan = PLANS.get(plan_key)
-    if not plan:
-        return await c.answer("Тариф не найден", show_alert=True)
+async def create_plan_payment(c: CallbackQuery, plan_key: str, selected: list[str]) -> None:
+    plan = PLANS[plan_key]
     order_id = str(uuid.uuid4())
     assert db
     await db.execute("INSERT INTO payments(order_id,tg_id,amount,plan_key,status,created_at) VALUES(?,?,?,?,?,?)",
@@ -311,7 +381,6 @@ async def choose_locations(c: CallbackQuery):
     await db.execute("UPDATE payments SET locations=? WHERE order_id=?", (json.dumps(selected), order_id))
     await db.commit()
     try:
-        # Payment is created server-side. The opaque order id is the callback payload.
         result = await platega_request("POST", "/transaction/process", {
             "paymentMethod": PAYMENT_METHOD,
             "paymentDetails": {"amount": plan["price"], "currency": CURRENCY},
@@ -329,19 +398,38 @@ async def choose_locations(c: CallbackQuery):
         await db.commit()
         await c.message.edit_text(
             f"💳 <b>Заказ создан</b>\n\nТариф: {plan['title']}\nСумма: <b>{plan['price']} ₽</b>\n\n"
-            "После оплаты VPN подключится автоматически.",
-            reply_markup=kb([[("💳 Перейти к оплате", "noop")], [("⬅️ В меню", "home")]]))
-        # URL button is emitted separately because Telegram callback_data is not a URL.
+            "После оплаты бот активирует единую подписку со всеми доступными локациями.",
+            reply_markup=kb([[("⬅️ В меню", "home")]]))
         await c.message.answer("Нажмите кнопку ниже для оплаты.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Оплатить", url=pay_url)],
             [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check:{order_id}")]
         ]))
-    except Exception as e:
+    except Exception:
         log.exception("Payment creation failed")
         await db.execute("UPDATE payments SET status='ERROR' WHERE order_id=?", (order_id,))
         await db.commit()
         await c.message.edit_text("Не удалось создать платёж. Попробуйте позже или обратитесь в поддержку.", reply_markup=home_kb())
     await c.answer()
+
+
+@dp.callback_query(F.data.startswith("plan:"))
+async def choose_plan(c: CallbackQuery):
+    key = c.data.split(":", 1)[1]
+    if key not in PLANS:
+        return await c.answer("Тариф не найден", show_alert=True)
+    if not LOCATIONS:
+        try:
+            discovered, _ = await discover_h1_locations()
+            if discovered:
+                LOCATIONS.clear()
+                LOCATIONS.update(discovered)
+        except Exception:
+            log.exception("On-demand H1 location discovery failed")
+    if not LOCATIONS:
+        return await c.answer("Не удалось получить локации H1. Напишите администратору.", show_alert=True)
+    await ensure_user(c.from_user.id, c.from_user.username)
+    # One purchase creates one client identity across every discovered node/inbound.
+    await create_plan_payment(c, key, list(LOCATIONS.keys()))
 
 
 @dp.callback_query(F.data.startswith("check:"))
@@ -384,24 +472,35 @@ async def provision_paid_order(order_id: str) -> None:
         client_uuid = user["client_uuid"] if user and user["client_uuid"] else str(uuid.uuid4())
         selected = json.loads(order["locations"] or "[]") or list(LOCATIONS.keys())
         expires_at = max(int(user["expires_at"] or 0) if user else 0, int(time.time())) + plan["days"] * 86400
-        success_nodes = []
+        # Group all selected country inbounds by H1 node. A single create request per
+        # node is important: it attaches the same client UUID to every local inbound.
+        node_configs: dict[str, dict] = {}
         for loc in selected:
             cfg = LOCATIONS[loc]
             node_id = str(cfg.get("node_id", "")).strip()
-            inbounds = cfg.get("inbound_ids", [])
+            grouped = node_configs.setdefault(node_id, {"inbound_ids": [], "channels": []})
+            for inbound_id in cfg.get("inbound_ids", []):
+                if str(inbound_id) not in [str(x) for x in grouped["inbound_ids"]]:
+                    grouped["inbound_ids"].append(str(inbound_id))
+            for channel in cfg.get("channels", DEFAULT_CHANNELS):
+                if channel not in grouped["channels"]:
+                    grouped["channels"].append(channel)
+        success_nodes = []
+        for node_id, cfg in node_configs.items():
+            inbounds = cfg["inbound_ids"]
+            if not inbounds:
+                raise RuntimeError(f"No inbound IDs discovered for H1 node {node_id or 'primary'}")
             path = f"/fed/lproxy/{quote(node_id, safe='')}/create" if node_id else "/create"
-            # On retry, check whether this node already has the client before creating it again.
             existing_path = f"/fed/lproxy/{quote(node_id, safe='')}/clients/{quote(client_name, safe='')}" if node_id else f"/clients/{quote(client_name, safe='')}"
             existing_client = None
             try:
                 existing = await panel_request("GET", existing_path)
                 candidate = existing.get("client", existing)
-                if candidate.get("uuid") == client_uuid:
+                if isinstance(candidate, dict) and candidate.get("uuid") == client_uuid:
                     existing_client = candidate
             except Exception:
                 existing_client = None
             if existing_client:
-                # H1 PATCH with expires_at is repeat-safe and preserves current inbound/channel membership.
                 await panel_request("PATCH", existing_path, {
                     "expires_at": expires_at, "device_limit": plan["devices"],
                     "traffic_limit_gb": DEFAULT_TRAFFIC_GB
@@ -411,11 +510,11 @@ async def provision_paid_order(order_id: str) -> None:
                     "name": client_name, "uuid": client_uuid, "expires_at": expires_at,
                     "days": plan["days"], "device_limit": plan["devices"],
                     "traffic_limit_gb": DEFAULT_TRAFFIC_GB, "manual": True,
-                    "channels": cfg.get("channels", DEFAULT_CHANNELS),
+                    "channels": cfg["channels"] or DEFAULT_CHANNELS,
                     "inbound_ids": inbounds
                 }
                 await panel_request("POST", path, payload)
-            success_nodes.append(loc)
+            success_nodes.append(node_id or "primary")
         # Read the canonical client on the primary panel to get the panel-generated unified subscription URL.
         canonical = await panel_request("GET", f"/clients/{quote(client_name, safe='')}")
         client = canonical.get("client", canonical)
