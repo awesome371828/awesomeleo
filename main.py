@@ -277,7 +277,11 @@ async def check_payment(c: CallbackQuery):
         state = (await cur.fetchone())["status"]
         await c.answer("Оплата подтверждена!" if state == "CONFIRMED" else "Платёж пока не подтверждён.")
         if state == "CONFIRMED":
-            await c.message.answer("✅ Оплата получена! VPN-подписка активирована. Откройте «Мой VPN».", reply_markup=home_kb())
+            cur = await db.execute("SELECT plan_key,amount FROM payments WHERE order_id=?", (order_id,))
+            paid = await cur.fetchone()
+            message = (f"✅ Баланс пополнен на <b>{paid['amount']:.0f} ₽</b>." if paid and str(paid["plan_key"] or "").startswith("balance:")
+                       else "✅ Оплата получена! VPN-подписка активирована. Откройте «Мой VPN».")
+            await c.message.answer(message, reply_markup=home_kb())
     except Exception:
         log.exception("Payment status check failed")
         await c.answer("Не удалось проверить платёж. Попробуйте ещё раз.", show_alert=True)
