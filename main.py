@@ -791,6 +791,10 @@ async def admin_home(message: Message):
         reply_markup=admin_kb()
     )
 
+@dp.message(Command("myid"))
+async def my_id_command(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
 @dp.message(Command("admin"))
 async def admin_command(message: Message):
     await admin_home(message)
