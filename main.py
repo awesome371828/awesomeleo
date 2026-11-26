@@ -305,23 +305,30 @@ async def provision_paid_order(order_id: str) -> None:
             inbounds = cfg.get("inbound_ids", [])
             path = f"/fed/lproxy/{quote(node_id, safe='')}/create" if node_id else "/create"
             # On retry, check whether this node already has the client before creating it again.
+            existing_path = f"/fed/lproxy/{quote(node_id, safe='')}/clients/{quote(client_name, safe='')}" if node_id else f"/clients/{quote(client_name, safe='')}"
+            existing_client = None
             try:
-                existing_path = f"/fed/lproxy/{quote(node_id, safe='')}/clients/{quote(client_name, safe='')}" if node_id else f"/clients/{quote(client_name, safe='')}"
                 existing = await panel_request("GET", existing_path)
-                client = existing.get("client", existing)
-                if client.get("uuid") == client_uuid:
-                    success_nodes.append(loc)
-                    continue
+                candidate = existing.get("client", existing)
+                if candidate.get("uuid") == client_uuid:
+                    existing_client = candidate
             except Exception:
-                pass
-            payload = {
-                "name": client_name, "uuid": client_uuid, "expires_at": expires_at,
-                "days": plan["days"], "device_limit": plan["devices"],
-                "traffic_limit_gb": DEFAULT_TRAFFIC_GB, "manual": True,
-                "channels": cfg.get("channels", DEFAULT_CHANNELS),
-                "inbound_ids": inbounds
-            }
-            await panel_request("POST", path, payload)
+                existing_client = None
+            if existing_client:
+                # H1 PATCH with expires_at is repeat-safe and preserves current inbound/channel membership.
+                await panel_request("PATCH", existing_path, {
+                    "expires_at": expires_at, "device_limit": plan["devices"],
+                    "traffic_limit_gb": DEFAULT_TRAFFIC_GB
+                })
+            else:
+                payload = {
+                    "name": client_name, "uuid": client_uuid, "expires_at": expires_at,
+                    "days": plan["days"], "device_limit": plan["devices"],
+                    "traffic_limit_gb": DEFAULT_TRAFFIC_GB, "manual": True,
+                    "channels": cfg.get("channels", DEFAULT_CHANNELS),
+                    "inbound_ids": inbounds
+                }
+                await panel_request("POST", path, payload)
             success_nodes.append(loc)
         # Read the canonical client on the primary panel to get the panel-generated unified subscription URL.
         canonical = await panel_request("GET", f"/clients/{quote(client_name, safe='')}")
