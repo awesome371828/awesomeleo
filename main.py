@@ -28,8 +28,20 @@ log = logging.getLogger("awesomevpn")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PANEL_API_TOKEN = os.getenv("PANEL_API_TOKEN", "").strip()
 PANEL_API_URL = os.getenv("PANEL_API_URL", "").strip().rstrip("/")
-if PANEL_API_URL.endswith("/api"):
-    PANEL_API_URL = PANEL_API_URL[:-4]
+# Relax Dev variables are sometimes entered as "host/panel" without a scheme.
+# The H1 API base shown in the panel is https://<host>/api; normalize to the
+# origin here because panel_request appends the documented /api prefix.
+if PANEL_API_URL and "://" not in PANEL_API_URL:
+    PANEL_API_URL = "https://" + PANEL_API_URL
+if PANEL_API_URL:
+    from urllib.parse import urlsplit, urlunsplit
+    _panel_parts = urlsplit(PANEL_API_URL)
+    _panel_path = _panel_parts.path.rstrip("/")
+    if _panel_path.endswith("/api"):
+        _panel_path = _panel_path[:-4]
+    if _panel_path.endswith("/panel"):
+        _panel_path = _panel_path[:-6]
+    PANEL_API_URL = urlunsplit((_panel_parts.scheme or "https", _panel_parts.netloc, _panel_path, "", "")).rstrip("/")
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
 PLATEGA_SECRET = (os.getenv("PLATEGA_SECRET", "") or os.getenv("PLATEGA_API", "")).strip()
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
@@ -131,7 +143,11 @@ async def ensure_user(tg_id: int, username: str | None) -> aiosqlite.Row:
 
 async def panel_request(method: str, path: str, payload: dict | None = None) -> dict:
     assert http
-    url = f"{PANEL_API_URL}/api{path}"
+    # Accept both API-relative paths and paths that already include /api.
+    clean_path = "/" + path.lstrip("/")
+    if clean_path.startswith("/api/"):
+        clean_path = clean_path[4:]
+    url = f"{PANEL_API_URL}/api{clean_path}"
     async with http.request(method, url, headers={"Authorization": f"Bearer {PANEL_API_TOKEN}", "Accept": "application/json"},
                             json=payload, timeout=ClientTimeout(total=35)) as resp:
         data = await resp.json(content_type=None)
