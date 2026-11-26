@@ -29,6 +29,8 @@ log = logging.getLogger("awesomevpn")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PANEL_API_TOKEN = os.getenv("PANEL_API_TOKEN", "").strip()
 PANEL_API_URL = os.getenv("PANEL_API_URL", "").strip().rstrip("/")
+if PANEL_API_URL.endswith("/api"):
+    PANEL_API_URL = PANEL_API_URL[:-4]
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
 PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
