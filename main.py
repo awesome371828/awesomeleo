@@ -154,8 +154,8 @@ async def panel_request(method: str, path: str, payload: dict | None = None) -> 
                             json=payload, timeout=ClientTimeout(total=35)) as resp:
         data = await resp.json(content_type=None)
         if resp.status >= 400 or (isinstance(data, dict) and (data.get("ok") is False or data.get("success") is False)):
-            message = (data.get("msg") or data.get("message") or "request rejected") if isinstance(data, dict) else "request rejected"
-            raise RuntimeError(f"Panel API {resp.status}: {message}")
+            message = (data.get("msg") or data.get("message") or data.get("detail") or data.get("error") or "request rejected") if isinstance(data, dict) else str(data)
+            raise RuntimeError(f"Panel API {resp.status}: {str(message)[:500]}")
         if not isinstance(data, dict):
             raise RuntimeError(f"Unexpected panel response: {data!r}")
         return data
@@ -525,10 +525,13 @@ async def provision_paid_order(order_id: str) -> None:
             try:
                 existing = await panel_request("GET", existing_path)
                 candidate = existing.get("client", existing)
-                if isinstance(candidate, dict) and candidate.get("uuid") == client_uuid:
+                if isinstance(candidate, dict):
+                    if str(candidate.get("uuid") or "") != client_uuid:
+                        raise RuntimeError(f"409: клиент {client_name} уже существует на узле {node_id or 'primary'}, UUID отличается от записи бота.")
                     existing_client = candidate
-            except Exception:
-                existing_client = None
+            except RuntimeError as exc:
+                if "404" not in str(exc) and "not found" not in str(exc).lower():
+                    raise
             if existing_client:
                 await panel_request("PATCH", existing_path, {
                     "expires_at": expires_at, "device_limit": plan["devices"],
@@ -542,7 +545,16 @@ async def provision_paid_order(order_id: str) -> None:
                     "channels": cfg["channels"] or DEFAULT_CHANNELS,
                     "inbound_ids": inbounds
                 }
-                await panel_request("POST", path, payload)
+                try:
+                    await panel_request("POST", path, payload)
+                except RuntimeError as create_exc:
+                    if "409" not in str(create_exc):
+                        raise
+                    existing = await panel_request("GET", existing_path)
+                    candidate = existing.get("client", existing)
+                    if not isinstance(candidate, dict) or str(candidate.get("uuid") or "") != client_uuid:
+                        raise
+                    await panel_request("PATCH", existing_path, {"expires_at": expires_at, "device_limit": plan["devices"], "traffic_limit_gb": DEFAULT_TRAFFIC_GB})
             success_nodes.append(node_id or "primary")
         # Read the canonical client on the primary panel to get the panel-generated unified subscription URL.
         canonical = await panel_request("GET", f"/clients/{quote(client_name, safe='')}")
@@ -872,22 +884,32 @@ async def admin_create_subscription(target_id: int, plan_key: str) -> str:
         try:
             existing = await panel_request("GET", client_path)
             candidate = existing.get("client", existing)
-            if isinstance(candidate, dict) and str(candidate.get("uuid") or "") == client_uuid:
+            if isinstance(candidate, dict):
+                if str(candidate.get("uuid") or "") != client_uuid:
+                    raise RuntimeError(f"409: клиент {client_name} уже существует на узле {node_id or 'primary'}, UUID отличается от записи бота.")
                 existing_client = candidate
-        except Exception:
-            pass
+        except RuntimeError as exc:
+            if "404" not in str(exc) and "not found" not in str(exc).lower():
+                raise
         if existing_client:
-            await panel_request("PATCH", client_path, {
-                "expires_at": expires_at, "device_limit": plan["devices"],
-                "traffic_limit_gb": DEFAULT_TRAFFIC_GB
-            })
+            await panel_request("PATCH", client_path, {"expires_at": expires_at, "device_limit": plan["devices"], "traffic_limit_gb": DEFAULT_TRAFFIC_GB})
         else:
-            await panel_request("POST", create_path, {
+            payload = {
                 "name": client_name, "uuid": client_uuid, "expires_at": expires_at,
                 "device_limit": plan["devices"], "traffic_limit_gb": DEFAULT_TRAFFIC_GB,
                 "manual": True, "channels": cfg["channels"] or DEFAULT_CHANNELS,
                 "inbound_ids": cfg["inbound_ids"]
-            })
+            }
+            try:
+                await panel_request("POST", create_path, payload)
+            except RuntimeError as create_exc:
+                if "409" not in str(create_exc):
+                    raise
+                existing = await panel_request("GET", client_path)
+                candidate = existing.get("client", existing)
+                if not isinstance(candidate, dict) or str(candidate.get("uuid") or "") != client_uuid:
+                    raise
+                await panel_request("PATCH", client_path, {"expires_at": expires_at, "device_limit": plan["devices"], "traffic_limit_gb": DEFAULT_TRAFFIC_GB})
         completed.append(node_id or "primary")
     canonical = await panel_request("GET", f"/clients/{quote(client_name, safe='')}")
     client = canonical.get("client", canonical)
