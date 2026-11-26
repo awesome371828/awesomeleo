@@ -449,7 +449,7 @@ async def noop(c: CallbackQuery):
     await c.answer()
 
 
-async def platega_callback(request: web.Request) -> web.Response:
+async async def platega_callback(request: web.Request) -> web.Response:
     # Platega callback authentication: compare both merchant headers; never trust body alone.
     if request.headers.get("X-MerchantId", "") != PLATEGA_MERCHANT_ID or not secrets.compare_digest(
         request.headers.get("X-Secret", ""), PLATEGA_SECRET
