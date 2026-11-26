@@ -471,6 +471,15 @@ async def provision_paid_order(order_id: str) -> None:
         client_name = user["client_name"] if user and user["client_name"] else f"tg_{order['tg_id']}"
         client_uuid = user["client_uuid"] if user and user["client_uuid"] else str(uuid.uuid4())
         selected = json.loads(order["locations"] or "[]") or list(LOCATIONS.keys())
+        missing_locations = [name for name in selected if name not in LOCATIONS]
+        if missing_locations:
+            # Pending orders may be confirmed after a bot restart; rebuild the in-memory
+            # map before provisioning so payment reconciliation never depends on RAM state.
+            discovered, _ = await discover_h1_locations()
+            LOCATIONS.update(discovered)
+            still_missing = [name for name in selected if name not in LOCATIONS]
+            if still_missing:
+                raise RuntimeError("H1 locations are not discoverable: " + ", ".join(still_missing))
         expires_at = max(int(user["expires_at"] or 0) if user else 0, int(time.time())) + plan["days"] * 86400
         # Group all selected country inbounds by H1 node. A single create request per
         # node is important: it attaches the same client UUID to every local inbound.
