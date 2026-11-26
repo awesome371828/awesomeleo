@@ -5,15 +5,14 @@ import html
 import json
 import logging
 import os
-import secrets
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote
 
 import aiosqlite
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -33,7 +32,6 @@ if PANEL_API_URL.endswith("/api"):
     PANEL_API_URL = PANEL_API_URL[:-4]
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
 PLATEGA_SECRET = (os.getenv("PLATEGA_SECRET", "") or os.getenv("PLATEGA_API", "")).strip()
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 DB_PATH = os.getenv("DB_PATH", "data/awesomevpn.sqlite3")
 PLATEGA_API = os.getenv("PLATEGA_API_URL", "https://app.platega.io").rstrip("/")
@@ -64,14 +62,13 @@ if not PLATEGA_MERCHANT_ID or not PLATEGA_SECRET:
         "Platega credentials are not visible to this process. In Relax Dev, save "
         "PLATEGA_MERCHANT_ID and PLATEGA_SECRET, then restart/redeploy the latest commit."
     )
-if not PUBLIC_BASE_URL.startswith("https://"):
-    raise RuntimeError("PUBLIC_BASE_URL must be a public HTTPS URL")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 http: ClientSession | None = None
 db: aiosqlite.Connection | None = None
 user_locks: dict[int, asyncio.Lock] = {}
+payment_locks: dict[str, asyncio.Lock] = {}
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -239,8 +236,6 @@ async def choose_locations(c: CallbackQuery):
             "paymentMethod": PAYMENT_METHOD,
             "paymentDetails": {"amount": plan["price"], "currency": CURRENCY},
             "description": f"Awesome VPN — {plan['title']}",
-            "return": PUBLIC_BASE_URL + "/payment/return",
-            "failedUrl": PUBLIC_BASE_URL + "/payment/failed",
             "payload": order_id,
             "orderId": order_id,
             "metadata": {"userId": str(c.from_user.id), "userName": c.from_user.username or "",
@@ -280,16 +275,13 @@ async def check_payment(c: CallbackQuery):
     if order["status"] == "CONFIRMED":
         return await c.answer("Оплата уже подтверждена", show_alert=True)
     try:
-        await verify_and_process(order["provider_id"], order_id)
-        cur = await db.execute("SELECT status FROM payments WHERE order_id=?", (order_id,))
-        state = (await cur.fetchone())["status"]
-        await c.answer("Оплата подтверждена!" if state == "CONFIRMED" else "Платёж пока не подтверждён.")
+        state = await verify_and_process(order["provider_id"], order_id)
         if state == "CONFIRMED":
-            cur = await db.execute("SELECT plan_key,amount FROM payments WHERE order_id=?", (order_id,))
-            paid = await cur.fetchone()
-            message = (f"✅ Баланс пополнен на <b>{paid['amount']:.0f} ₽</b>." if paid and str(paid["plan_key"] or "").startswith("balance:")
-                       else "✅ Оплата получена! VPN-подписка активирована. Откройте «Мой VPN».")
-            await c.message.answer(message, reply_markup=home_kb())
+            await c.answer("Оплата подтверждена. Доступ или баланс обновлён!")
+        elif state == "CANCELED":
+            await c.answer("Платёж отменён.", show_alert=True)
+        else:
+            await c.answer("Платёж пока не подтверждён. Бот проверит его автоматически.")
     except Exception:
         log.exception("Payment status check failed")
         await c.answer("Не удалось проверить платёж. Попробуйте ещё раз.", show_alert=True)
@@ -357,29 +349,88 @@ async def provision_paid_order(order_id: str) -> None:
         await bot.send_message(order["tg_id"], "🎉 <b>Оплата получена!</b>\n\nVPN активирован. Нажмите «Мой VPN», чтобы получить ссылку для подключения.", reply_markup=home_kb())
 
 
-async def verify_and_process(provider_id: str, order_id: str) -> None:
+async def verify_and_process(provider_id: str, order_id: str) -> str:
+    """Query Platega directly; no public webhook/domain is required."""
     if not provider_id:
         raise RuntimeError("Missing Platega transaction id")
-    data = await platega_request("GET", f"/transaction/{quote(provider_id, safe='')}")
-    if data.get("status") != "CONFIRMED":
-        return
-    assert db
-    cur = await db.execute("SELECT amount FROM payments WHERE order_id=?", (order_id,))
-    order = await cur.fetchone()
-    actual = (data.get("paymentDetails") or {}).get("amount")
-    if order and actual is not None and float(actual) != float(order["amount"]):
-        raise RuntimeError("Payment amount mismatch")
-    assert db
-    cur = await db.execute("SELECT * FROM payments WHERE order_id=?", (order_id,))
-    order = await cur.fetchone()
-    if order and str(order["plan_key"] or "").startswith("balance:"):
-        if order["status"] != "CONFIRMED" or not order["processed_at"]:
-            await db.execute("UPDATE users SET balance=balance+? WHERE tg_id=?", (float(order["amount"]), order["tg_id"]))
-            await db.execute("UPDATE payments SET status='CONFIRMED',processed_at=? WHERE order_id=?", (int(time.time()), order_id))
+    lock = payment_locks.setdefault(order_id, asyncio.Lock())
+    async with lock:
+        assert db
+        cur = await db.execute("SELECT * FROM payments WHERE order_id=?", (order_id,))
+        order = await cur.fetchone()
+        if not order:
+            raise RuntimeError("Unknown local payment order")
+        if order["status"] == "CONFIRMED" and order["processed_at"]:
+            return "CONFIRMED"
+
+        data = await platega_request("GET", f"/transaction/{quote(provider_id, safe='')}")
+        state = str(data.get("status", "PENDING")).upper()
+        if state == "CANCELED":
+            await db.execute(
+                "UPDATE payments SET status='CANCELED' WHERE order_id=? AND status!='CONFIRMED'",
+                (order_id,)
+            )
             await db.commit()
-            await bot.send_message(order["tg_id"], f"✅ Баланс пополнен на <b>{order['amount']:.0f} ₽</b>.", reply_markup=home_kb())
-        return
-    await provision_paid_order(order_id)
+            return "CANCELED"
+        if state != "CONFIRMED":
+            return state
+
+        actual = (data.get("paymentDetails") or {}).get("amount")
+        if actual is not None and float(actual) != float(order["amount"]):
+            raise RuntimeError("Payment amount mismatch")
+        actual_currency = (data.get("paymentDetails") or {}).get("currency")
+        if actual_currency and actual_currency != CURRENCY:
+            raise RuntimeError("Payment currency mismatch")
+
+        if str(order["plan_key"] or "").startswith("balance:"):
+            if not order["processed_at"]:
+                await db.execute(
+                    "UPDATE users SET balance=balance+? WHERE tg_id=?",
+                    (float(order["amount"]), order["tg_id"])
+                )
+                await db.execute(
+                    "UPDATE payments SET status='CONFIRMED',processed_at=? WHERE order_id=? AND processed_at IS NULL",
+                    (int(time.time()), order_id)
+                )
+                await db.commit()
+                await bot.send_message(
+                    order["tg_id"],
+                    f"✅ Баланс пополнен на <b>{order['amount']:.0f} ₽</b>.",
+                    reply_markup=home_kb()
+                )
+            return "CONFIRMED"
+
+        await provision_paid_order(order_id)
+        return "CONFIRMED"
+
+
+async def poll_pending_payments() -> None:
+    """Background reconciliation for pending Platega transactions."""
+    interval = max(10, int(os.getenv("PAYMENT_POLL_INTERVAL", "20")))
+    log.info("Platega payment polling enabled (interval=%ss)", interval)
+    while True:
+        try:
+            assert db
+            cur = await db.execute(
+                "SELECT order_id,provider_id FROM payments "
+                "WHERE status IN ('PENDING','CREATING') AND provider_id IS NOT NULL "
+                "ORDER BY created_at ASC LIMIT 50"
+            )
+            pending = await cur.fetchall()
+            for row in pending:
+                try:
+                    state = await verify_and_process(row["provider_id"], row["order_id"])
+                    if state == "CONFIRMED":
+                        log.info("Platega order %s confirmed by polling", row["order_id"])
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Platega polling failed for order %s", row["order_id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Platega payment polling loop failed")
+        await asyncio.sleep(interval)
 
 
 @dp.callback_query(F.data == "profile")
@@ -472,8 +523,6 @@ async def balance_amount(c: CallbackQuery):
             "paymentMethod": PAYMENT_METHOD,
             "paymentDetails": {"amount": amount, "currency": CURRENCY},
             "description": "Пополнение баланса Awesome VPN",
-            "return": PUBLIC_BASE_URL + "/payment/return",
-            "failedUrl": PUBLIC_BASE_URL + "/payment/failed",
             "payload": order_id, "orderId": order_id,
             "metadata": {"userId": str(c.from_user.id), "userName": c.from_user.username or "",
                          "user_email": f"{c.from_user.id}@telegram.org"}
@@ -513,55 +562,20 @@ async def noop(c: CallbackQuery):
     await c.answer()
 
 
-async def platega_callback(request: web.Request) -> web.Response:
-    # Platega callback authentication: compare both merchant headers; never trust body alone.
-    if request.headers.get("X-MerchantId", "") != PLATEGA_MERCHANT_ID or not secrets.compare_digest(
-        request.headers.get("X-Secret", ""), PLATEGA_SECRET
-    ):
-        raise web.HTTPUnauthorized(text="invalid callback credentials")
-    payload = await request.json()
-    payment_id = str(payload.get("id") or "")
-    order_id = str(payload.get("payload") or "")
-    if not payment_id or not order_id:
-        raise web.HTTPBadRequest(text="missing payment id/payload")
-    assert db
-    cur = await db.execute("SELECT * FROM payments WHERE order_id=?", (order_id,))
-    order = await cur.fetchone()
-    if not order:
-        raise web.HTTPNotFound(text="unknown order")
-    if float(payload.get("amount", -1)) != float(order["amount"]) or payload.get("currency") != CURRENCY:
-        raise web.HTTPBadRequest(text="amount/currency mismatch")
-    # Verify final status with Platega API before activating access.
-    if payload.get("status") == "CONFIRMED":
-        await verify_and_process(order["provider_id"], order_id)
-    await db.execute("INSERT OR IGNORE INTO processed_callbacks(payment_id,received_at) VALUES(?,?)",
-                     (payment_id, int(time.time())))
-    await db.commit()
-    return web.json_response({"ok": True})
-
-
-async def health(_: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "awesomevpn"})
-
-
 async def main():
     global http
     await init_db()
     http = ClientSession(timeout=ClientTimeout(total=35))
-    app = web.Application(client_max_size=1024 * 1024)
-    app.router.add_get("/health", health)
-    app.router.add_get("/payment/return", health)
-    app.router.add_get("/payment/failed", health)
-    app.router.add_post("/platega/callback", platega_callback)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080")))
-    await site.start()
-    log.info("HTTP callback server started on port %s", os.getenv("PORT", "8080"))
+    payment_poller = asyncio.create_task(poll_pending_payments(), name="platega-payment-poller")
     try:
+        log.info("Awesome VPN Telegram bot started; no public domain/webhook required")
         await dp.start_polling(bot)
     finally:
-        await runner.cleanup()
+        payment_poller.cancel()
+        try:
+            await payment_poller
+        except asyncio.CancelledError:
+            pass
         await http.close()
         if db:
             await db.close()
