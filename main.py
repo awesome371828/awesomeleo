@@ -95,7 +95,7 @@ async def init_db() -> None:
     );
     CREATE TABLE IF NOT EXISTS payments(
       order_id TEXT PRIMARY KEY, tg_id INTEGER NOT NULL, amount REAL NOT NULL,
-      plan_key TEXT, status TEXT NOT NULL, provider_id TEXT, created_at INTEGER NOT NULL,
+      plan_key TEXT, locations TEXT NOT NULL DEFAULT '[]', status TEXT NOT NULL, provider_id TEXT, created_at INTEGER NOT NULL,
       processed_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS processed_callbacks(
@@ -103,6 +103,11 @@ async def init_db() -> None:
     );
     """)
     await db.commit()
+    try:
+        await db.execute("ALTER TABLE payments ADD COLUMN locations TEXT NOT NULL DEFAULT '[]'")
+        await db.commit()
+    except Exception:
+        pass
 
 
 async def ensure_user(tg_id: int, username: str | None) -> aiosqlite.Row:
@@ -216,6 +221,7 @@ async def choose_locations(c: CallbackQuery):
     assert db
     await db.execute("INSERT INTO payments(order_id,tg_id,amount,plan_key,status,created_at) VALUES(?,?,?,?,?,?)",
                      (order_id, c.from_user.id, plan["price"], plan_key, "CREATING", int(time.time())))
+    await db.execute("UPDATE payments SET locations=? WHERE order_id=?", (json.dumps(selected), order_id))
     await db.commit()
     try:
         # Payment is created server-side. The opaque order id is the callback payload.
@@ -290,10 +296,7 @@ async def provision_paid_order(order_id: str) -> None:
         user = await cur.fetchone()
         client_name = user["client_name"] if user and user["client_name"] else f"tg_{order['tg_id']}"
         client_uuid = user["client_uuid"] if user and user["client_uuid"] else str(uuid.uuid4())
-        selected = json.loads(user["selected_locations"] or "[]") if user else []
-        # The location choice is saved on the payment before the API call.
-        if not selected:
-            selected = list(LOCATIONS.keys())
+        selected = json.loads(order["locations"] or "[]") or list(LOCATIONS.keys())
         expires_at = max(int(user["expires_at"] or 0) if user else 0, int(time.time())) + plan["days"] * 86400
         success_nodes = []
         for loc in selected:
@@ -373,17 +376,21 @@ async def profile(c: CallbackQuery):
 
 
 def profile_kb(sub_url: str) -> InlineKeyboardMarkup:
-    rows = [[("🔗 Подписка", url=sub_url)] ] if sub_url.startswith("https://") else []
+    rows: list[list[InlineKeyboardButton]] = []
     if sub_url.startswith("https://"):
         base = sub_url.rstrip("/")
-        rows += [[("➕ Happ", url=base + "/open/happ"), ("➕ v2rayTun", url=base + "/open/v2raytun")],
-                 [("➕ INCI", url=base + "/open/inci")]]
-    rows += [[("📲 Мои устройства", "apps")], [("🌍 Локации", "locations")], [("⬅️ В меню", "home")]]
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, url=v) if isinstance(v, str) and v.startswith("https://") else InlineKeyboardButton(text=t, callback_data=v)
-         for item in row for t, v in ([item] if len(item)==2 else [])]
-        for row in rows
+        rows.append([InlineKeyboardButton(text="🔗 Подписка", url=sub_url)])
+        rows.append([
+            InlineKeyboardButton(text="➕ Happ", url=base + "/open/happ"),
+            InlineKeyboardButton(text="➕ v2rayTun", url=base + "/open/v2raytun"),
+        ])
+        rows.append([InlineKeyboardButton(text="➕ INCI", url=base + "/open/inci")])
+    rows.extend([
+        [InlineKeyboardButton(text="📲 Мои устройства", callback_data="apps")],
+        [InlineKeyboardButton(text="🌍 Локации", callback_data="locations")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="home")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(F.data == "apps")
@@ -470,6 +477,8 @@ async def main():
     http = ClientSession(timeout=ClientTimeout(total=35))
     app = web.Application(client_max_size=1024 * 1024)
     app.router.add_get("/health", health)
+    app.router.add_get("/payment/return", health)
+    app.router.add_get("/payment/failed", health)
     app.router.add_post("/platega/callback", platega_callback)
     runner = web.AppRunner(app)
     await runner.setup()
