@@ -357,6 +357,16 @@ async def verify_and_process(provider_id: str, order_id: str) -> None:
     actual = (data.get("paymentDetails") or {}).get("amount")
     if order and actual is not None and float(actual) != float(order["amount"]):
         raise RuntimeError("Payment amount mismatch")
+    assert db
+    cur = await db.execute("SELECT * FROM payments WHERE order_id=?", (order_id,))
+    order = await cur.fetchone()
+    if order and str(order["plan_key"] or "").startswith("balance:"):
+        if order["status"] != "CONFIRMED" or not order["processed_at"]:
+            await db.execute("UPDATE users SET balance=balance+? WHERE tg_id=?", (float(order["amount"]), order["tg_id"]))
+            await db.execute("UPDATE payments SET status='CONFIRMED',processed_at=? WHERE order_id=?", (int(time.time()), order_id))
+            await db.commit()
+            await bot.send_message(order["tg_id"], f"✅ Баланс пополнен на <b>{order['amount']:.0f} ₽</b>.", reply_markup=home_kb())
+        return
     await provision_paid_order(order_id)
 
 
@@ -429,7 +439,49 @@ async def locations(c: CallbackQuery):
 
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):
-    await c.answer("Пополнение баланса будет добавлено отдельным сценарием. Сейчас оплата доступна при покупке тарифа.", show_alert=True)
+    await c.message.edit_text("💳 <b>Пополнение баланса</b>\\n\\nВыберите сумму:", reply_markup=kb([
+        [("100 ₽", "balance_amt:100"), ("300 ₽", "balance_amt:300")],
+        [("500 ₽", "balance_amt:500"), ("1000 ₽", "balance_amt:1000")],
+        [("⬅️ В меню", "home")]
+    ]))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("balance_amt:"))
+async def balance_amount(c: CallbackQuery):
+    amount = int(c.data.split(":", 1)[1])
+    order_id = str(uuid.uuid4())
+    assert db
+    await db.execute("INSERT INTO payments(order_id,tg_id,amount,plan_key,status,created_at) VALUES(?,?,?,?,?,?)",
+                     (order_id, c.from_user.id, amount, f"balance:{amount}", "CREATING", int(time.time())))
+    await db.commit()
+    try:
+        result = await platega_request("POST", "/transaction/process", {
+            "paymentMethod": PAYMENT_METHOD,
+            "paymentDetails": {"amount": amount, "currency": CURRENCY},
+            "description": "Пополнение баланса Awesome VPN",
+            "return": PUBLIC_BASE_URL + "/payment/return",
+            "failedUrl": PUBLIC_BASE_URL + "/payment/failed",
+            "payload": order_id, "orderId": order_id,
+            "metadata": {"userId": str(c.from_user.id), "userName": c.from_user.username or "",
+                         "user_email": f"{c.from_user.id}@telegram.org"}
+        })
+        provider_id = result.get("transactionId") or result.get("id")
+        pay_url = result.get("redirect") or result.get("url")
+        if not provider_id or not pay_url:
+            raise RuntimeError(f"Unexpected Platega response: {result}")
+        await db.execute("UPDATE payments SET status='PENDING',provider_id=? WHERE order_id=?", (provider_id, order_id))
+        await db.commit()
+        await c.message.edit_text(f"💳 Пополнение на <b>{amount} ₽</b>. После оплаты баланс обновится автоматически.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="Оплатить", url=pay_url)],
+                [InlineKeyboardButton(text="Проверить оплату", callback_data=f"check:{order_id}")],
+                [InlineKeyboardButton(text="⬅️ В меню", callback_data="home")]
+            ]))
+    except Exception:
+        log.exception("Balance payment creation failed")
+        await c.message.edit_text("Не удалось создать платёж. Попробуйте позже.", reply_markup=home_kb())
+    await c.answer()
 
 
 @dp.callback_query(F.data == "invite")
