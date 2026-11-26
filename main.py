@@ -132,8 +132,9 @@ async def panel_request(method: str, path: str, payload: dict | None = None) -> 
     async with http.request(method, url, headers={"Authorization": f"Bearer {PANEL_API_TOKEN}", "Accept": "application/json"},
                             json=payload, timeout=ClientTimeout(total=35)) as resp:
         data = await resp.json(content_type=None)
-        if resp.status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
-            raise RuntimeError(f"Panel API {resp.status}: {data}")
+        if resp.status >= 400 or (isinstance(data, dict) and (data.get("ok") is False or data.get("success") is False)):
+            message = (data.get("msg") or data.get("message") or "request rejected") if isinstance(data, dict) else "request rejected"
+            raise RuntimeError(f"Panel API {resp.status}: {message}")
         if not isinstance(data, dict):
             raise RuntimeError(f"Unexpected panel response: {data!r}")
         return data
@@ -155,6 +156,85 @@ def location_keyboard(prefix: str = "loc") -> InlineKeyboardMarkup:
     rows.append([("🌐 Все локации", f"{prefix}:all")])
     rows.append([("⬅️ Назад", "home")])
     return kb(rows)
+
+
+def _panel_safe_summary(value, depth: int = 0):
+    """Keep diagnostics useful while never exposing client credentials or secrets."""
+    if depth > 5:
+        return "…"
+    if isinstance(value, list):
+        return [_panel_safe_summary(item, depth + 1) for item in value[:30]]
+    if isinstance(value, dict):
+        hidden = ("token", "secret", "password", "uuid", "client", "private", "key")
+        result = {}
+        for key, item in value.items():
+            low = str(key).lower()
+            if any(word in low for word in hidden):
+                result[str(key)] = "[скрыто]"
+            elif isinstance(item, (dict, list)):
+                result[str(key)] = _panel_safe_summary(item, depth + 1)
+            elif isinstance(item, (str, int, float, bool)) or item is None:
+                result[str(key)] = item
+        return result
+    return value
+
+
+def _panel_items(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("obj", "data", "items", "nodes", "inbounds", "servers"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = _panel_items(value)
+                if nested:
+                    return nested
+    return []
+
+
+@dp.message(Command("h1diag"))
+async def h1_diagnostics(message: Message):
+    """Admin-only read-only discovery of connected H1 nodes and their inbounds."""
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("Команда доступна только администратору.")
+    await message.answer("🔎 Проверяю подключённые узлы и инбаунды H1. Это только GET-запросы, настройки не изменяются.")
+    reports = []
+    node_ids = []
+    for path, title in (("/fed/lagg", "Связанные серверы"), ("/inbounds", "Инбаунды основной панели")):
+        try:
+            data = await panel_request("GET", path)
+            safe = _panel_safe_summary(data)
+            reports.append(f"<b>{html.escape(title)}</b> <code>{html.escape(path)}</code>\n<pre>{html.escape(json.dumps(safe, ensure_ascii=False)[:2200])}</pre>")
+            if path == "/fed/lagg":
+                for item in _panel_items(data):
+                    if not isinstance(item, dict):
+                        continue
+                    node_id = next((item.get(k) for k in ("node_id", "nodeId", "id", "server_id", "serverId", "uuid") if item.get(k) not in (None, "")), None)
+                    if node_id is not None:
+                        node_ids.append(str(node_id))
+        except Exception as exc:
+            reports.append(f"<b>{html.escape(title)}</b> <code>{html.escape(path)}</code>\nОшибка: <code>{html.escape(str(exc)[:700])}</code>")
+    for node_id in dict.fromkeys(node_ids):
+        path = f"/fed/lproxy/{quote(node_id, safe='')}/inbounds"
+        try:
+            data = await panel_request("GET", path)
+            safe = _panel_safe_summary(data)
+            reports.append(f"<b>Инбаунды связанного узла {html.escape(node_id)}</b> <code>{html.escape(path)}</code>\n<pre>{html.escape(json.dumps(safe, ensure_ascii=False)[:2200])}</pre>")
+        except Exception as exc:
+            reports.append(f"<b>Инбаунды связанного узла {html.escape(node_id)}</b>\nОшибка <code>{html.escape(str(exc)[:700])}</code>")
+    output = "\n\n".join(reports) if reports else "Панель не вернула данные."
+    chunks = []
+    while len(output) > 3800:
+        cut = output.rfind("\n\n", 0, 3800)
+        if cut < 1:
+            cut = 3800
+        chunks.append(output[:cut])
+        output = output[cut:].lstrip()
+    chunks.append(output)
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 async def show_home(target: Message | CallbackQuery) -> None:
